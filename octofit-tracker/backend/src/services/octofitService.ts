@@ -14,6 +14,10 @@ function normalizeMinutes(value: unknown) {
   return null;
 }
 
+function normalizeGoal(value: unknown) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
 export async function listActivities() {
   return Activity.find().sort({ occurredAt: -1 }).lean();
 }
@@ -38,6 +42,12 @@ export async function createActivity(input: unknown) {
   if (!team) {
     throw Object.assign(new Error('Team not found for activity'), { status: 400 });
   }
+
+  if (user.team?.toString() !== team._id.toString()) {
+    user.team = team._id;
+    await user.save();
+  }
+  await Team.updateOne({ _id: team._id }, { $addToSet: { members: user._id } });
 
   const multiplier = type === 'strength' ? 1.5 : type === 'cycle' ? 1.25 : type === 'walk' ? 0.9 : 1;
   const activity = await Activity.create({
@@ -77,6 +87,13 @@ export async function createTeam(input: unknown) {
     return new mongoose.Types.ObjectId(member);
   });
 
+  const existingMembers = await User.find({ _id: { $in: validMembers } }).select('_id').lean();
+  const validExistingIds = new Set(existingMembers.map((member) => member._id.toString()));
+  const invalidMemberIds = validMembers.filter((member) => !validExistingIds.has(member.toString()));
+  if (invalidMemberIds.length > 0) {
+    throw Object.assign(new Error('Team members must reference existing users'), { status: 400 });
+  }
+
   const team = await Team.create({ name, mascot, members: validMembers });
   return team.toObject();
 }
@@ -109,17 +126,20 @@ export async function suggestWorkouts(userEmail: string) {
   }
 
   const recentActivity = await Activity.find({ user: user._id }).sort({ occurredAt: -1 }).limit(1).lean();
-  const preferredFocus = typeof user.fitnessGoal === 'string' && user.fitnessGoal.trim() ? user.fitnessGoal.trim().toLowerCase() : (recentActivity[0]?.type ?? 'endurance');
+  const preferredGoal = normalizeGoal(user.fitnessGoal) || normalizeGoal(recentActivity[0]?.type) || 'endurance';
+  const recentType = typeof recentActivity[0]?.type === 'string' ? recentActivity[0].type.toLowerCase() : '';
   const workouts = await Workout.find().lean();
 
   const ranked = workouts
     .map((workout) => {
       const focus = typeof workout.focus === 'string' ? workout.focus.toLowerCase() : '';
-      const activityType = typeof recentActivity[0]?.type === 'string' ? recentActivity[0].type.toLowerCase() : '';
       let score = 0;
-      if (focus === preferredFocus) score += 3;
-      if (focus === activityType) score += 2;
-      if (focus === user.fitnessGoal?.toLowerCase()) score += 2;
+      if (focus === preferredGoal) score += 4;
+      if (focus === recentType) score += 2;
+      if (focus === normalizeGoal(user.fitnessGoal)) score += 2;
+      if (focus.includes('endurance') && preferredGoal.includes('endurance')) score += 1;
+      if (focus.includes('strength') && preferredGoal.includes('strength')) score += 1;
+      if (focus.includes('mobility') && preferredGoal.includes('mobility')) score += 1;
       return { workout, score };
     })
     .sort((left, right) => right.score - left.score || left.workout.title.localeCompare(right.workout.title));
@@ -128,12 +148,17 @@ export async function suggestWorkouts(userEmail: string) {
     return [];
   }
 
-  const winningWorkout = ranked[0].workout;
-  const reason = recentActivity[0]?.type
-    ? `Matches your ${user.fitnessGoal || 'recent'} goal and recent ${recentActivity[0].type} activity.`
-    : `Matches your ${user.fitnessGoal || 'current'} goal.`;
-
-  return [{ ...winningWorkout, reason }];
+  return ranked.slice(0, 3).map(({ workout, score }) => {
+    const focus = typeof workout.focus === 'string' ? workout.focus : 'general fitness';
+    const reasonParts = [];
+    if (score >= 4) reasonParts.push(`matches your ${preferredGoal} goal`);
+    if (recentType) reasonParts.push(`fits your recent ${recentType} activity`);
+    if (!reasonParts.length) reasonParts.push('supports steady progress');
+    return {
+      ...workout,
+      reason: `${reasonParts.join(' and ')}.`,
+    };
+  });
 }
 
 export { User };
